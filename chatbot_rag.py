@@ -3,7 +3,7 @@
 # Brand: Action TESA — White main, dark sidebar, green accents
 # EBM: Ears (Whisper) + Brain (GPT-4o-mini RAG) + Mouth (TTS)
 # Hybrid: text OR voice input, text + audio output
-# Audio stored in session state — survives rerun
+# Voice input = autoplay audio. Text input = audio player.
 # ============================================================
 
 import os
@@ -13,6 +13,7 @@ import base64
 from audio_recorder_streamlit import audio_recorder
 from pinecone import Pinecone
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -39,6 +40,23 @@ def normalize_query(query):
         "ornamat": "Ornamatte",
         "hdhmr door": "HDHMR Doors",
         "moistro": "MOISTRO Doors",
+        # Hindi numbers
+        "एक": "1", "दो": "2", "तीन": "3", "चार": "4", "पाँच": "5",
+        "छह": "6", "सात": "7", "आठ": "8", "नौ": "9", "दस": "10",
+        "बारह": "12", "सोलह": "16", "अठारह": "18",
+        # Hindi thickness terms
+        "मिलीमीटर": "mm", "मिमी": "mm",
+        # Common Hindi product terms
+        "बोर्ड": "board", "दरवाज़ा": "door", "फर्श": "flooring",
+        "नमी": "moisture", "मोटाई": "thickness",
+        # Density terms in Hindi speech
+        "किलोग्राम": "kg",
+        "किलो": "kg", 
+        "घन": "cubic",
+        "घनमीटर": "m3",
+        "किलोग्राम प्रति घन मीटर": "kg/m3",
+        "डेंसिटी": "density",
+        "घनत्व": "density",
     }
     q = query.lower()
     for wrong, right in corrections.items():
@@ -79,6 +97,14 @@ def build_rag_prompt(query, chunks):
         for c in chunks
     ])
     return f"""You are answering a question about Action TESA wood panel products.
+Use the context below to answer. 
+
+Technical terms to interpret correctly:
+- kg/m3 = kilograms per cubic metre = density measurement
+- घनत्व / density above 850 refers to HDHMR Board
+- density above 1000 refers to BOILO BWP HDF Board
+
+Use the context below... You are answering a question about Action TESA wood panel products.
 Use the context below to answer. Context may come from PDFs with tables — extract any relevant numbers, specs, or facts even if formatting looks broken.
 
 If you find ANY relevant information, use it to answer fully and specifically.
@@ -106,6 +132,10 @@ CONSTRAINTS:
 - If context is truly insufficient, say so and give contact details.
 - Respond in the same language the user writes in — Hindi, English, or Hinglish.
 - When responding to voice queries, keep answers under 3 sentences so they sound natural when spoken.
+- When the user speaks in Hindi and mentions numbers or measurements, interpret them correctly — e.g. "बारह मिलीमीटर" means 12mm, "अठारह" means 18mm thickness.
+- "घनत्व" means density. "किलोग्राम प्रति घन मीटर" means kg/m3. Interpret these correctly when mentioned in Hindi voice queries.
+
+
 
 STRUCTURE:
 1. Direct answer (1-2 sentences)
@@ -347,6 +377,8 @@ if "total_tokens" not in st.session_state:
     st.session_state.total_tokens = 0
 if "last_audio" not in st.session_state:
     st.session_state.last_audio = None
+if "input_was_voice" not in st.session_state:
+    st.session_state.input_was_voice = False
 
 # ── HEADER ──
 st.markdown("""
@@ -390,6 +422,7 @@ prompt = None
 # Voice — EARS
 if audio_bytes and audio_bytes != st.session_state.get("last_audio"):
     st.session_state["last_audio"] = audio_bytes
+    st.session_state["input_was_voice"] = True
     with st.spinner("🎙️ Transcribing your voice..."):
         transcribed = transcribe_audio(audio_bytes)
     if transcribed:
@@ -399,11 +432,13 @@ if audio_bytes and audio_bytes != st.session_state.get("last_audio"):
 # Text
 if text_input:
     prompt = text_input
+    st.session_state["input_was_voice"] = False
 
 # Quick question
 if "quick_q" in st.session_state and st.session_state["quick_q"]:
     prompt = st.session_state["quick_q"]
     st.session_state["quick_q"] = None
+    st.session_state["input_was_voice"] = False
 
 # ── RAG WORKFLOW ──
 if prompt and db_loaded:
@@ -441,12 +476,22 @@ if prompt and db_loaded:
 
         st.markdown(reply)
 
-        # EBM: MOUTH — generate and store audio
+        # EBM: MOUTH — generate audio
         with st.spinner("🔊 Generating audio..."):
             audio_response = text_to_speech(reply)
 
         if audio_response:
-            st.audio(audio_response, format="audio/mp3")
+            if st.session_state.get("input_was_voice", False):
+                # User clicked mic — browser allows autoplay
+                b64 = base64.b64encode(audio_response).decode()
+                components.html(f"""
+                    <audio autoplay style="display:none;">
+                        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                    </audio>
+                """, height=0)
+            else:
+                # Text input — show player
+                st.audio(audio_response, format="audio/mp3")
 
         unique_sources = list(set([c["source"] for c in chunks]))
         st.markdown(" ".join([
