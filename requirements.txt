@@ -1,0 +1,10 @@
+openai
+streamlit
+chromadb
+python-dotenv
+requests
+beautifulsoup4
+pymupdf
+pytesseract
+pdf2image
+pillow
