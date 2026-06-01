@@ -1,11 +1,16 @@
 # ============================================================
-# chatbot_rag.py — TESA Advisor with RAG
+# chatbot_rag.py — TESA Advisor with RAG + Voice (EBM)
 # Brand: Action TESA — White main, dark sidebar, green accents
-# Includes: spelling correction, k=6 retrieval, relaxed prompt
+# EBM: Ears (Whisper) + Brain (GPT-4o-mini RAG) + Mouth (TTS)
+# Hybrid: text OR voice input, text + audio output
+# Audio stored in session state — survives rerun
 # ============================================================
 
 import os
 import time
+import io
+import base64
+from audio_recorder_streamlit import audio_recorder
 from pinecone import Pinecone
 import streamlit as st
 from openai import OpenAI
@@ -14,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-@st.cache_resource
+# ── PLATFORM LAYER: connect to Pinecone ──
 @st.cache_resource
 def load_vector_db():
     pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
@@ -48,7 +53,7 @@ def embed_query(query):
     )
     return response.data[0].embedding
 
-# ── RETRIEVE — k=6, uses normalized query ──
+# ── RETRIEVE ──
 def retrieve_chunks(query, index, k=6):
     normalized = normalize_query(query)
     query_embedding = embed_query(normalized)
@@ -67,7 +72,7 @@ def retrieve_chunks(query, index, k=6):
         })
     return chunks
 
-# ── RAG PROMPT — relaxed, handles table PDFs ──
+# ── RAG PROMPT ──
 def build_rag_prompt(query, chunks):
     context = "\n\n".join([
         f"[Source: {c['source']}]\n{c['text']}"
@@ -99,6 +104,8 @@ CONSTRAINTS:
 - Do not discuss competitor products.
 - For pricing: say "contact Action TESA directly".
 - If context is truly insufficient, say so and give contact details.
+- Respond in the same language the user writes in — Hindi, English, or Hinglish.
+- When responding to voice queries, keep answers under 3 sentences so they sound natural when spoken.
 
 STRUCTURE:
 1. Direct answer (1-2 sentences)
@@ -117,6 +124,35 @@ CONTACT (share when relevant):
 - Email: info@actiontesa.com
 - Website: www.actiontesa.com
 """
+
+# ── EBM: EARS — Whisper STT ──
+def transcribe_audio(audio_bytes):
+    try:
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "recording.wav"
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+        return transcript.text
+    except Exception as e:
+        print(f"STT error: {e}")
+        return None
+
+# ── EBM: MOUTH — OpenAI TTS ──
+def text_to_speech(text):
+    try:
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="nova",
+            input=text[:500]
+        )
+        audio_data = response.content
+        print(f"TTS success — {len(audio_data)} bytes generated")
+        return audio_data
+    except Exception as e:
+        print(f"TTS error: {e}")
+        return None
 
 # ── PAGE CONFIG ──
 st.set_page_config(
@@ -309,6 +345,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "total_tokens" not in st.session_state:
     st.session_state.total_tokens = 0
+if "last_audio" not in st.session_state:
+    st.session_state.last_audio = None
 
 # ── HEADER ──
 st.markdown("""
@@ -329,13 +367,43 @@ for message in st.session_state.messages:
                 f'<span class="source-tag">📄 {s}</span>'
                 for s in message["sources"]
             ]), unsafe_allow_html=True)
+        if "audio" in message and message["audio"]:
+            st.audio(message["audio"], format="audio/mp3")
 
-# ── INPUT ──
+# ── EBM HYBRID INPUT — Voice OR Text ──
+col1, col2 = st.columns([1, 11])
+with col1:
+    audio_bytes = audio_recorder(
+        text="",
+        recording_color="#4a9a3a",
+        neutral_color="#888888",
+        icon_size="2x"
+    )
+with col2:
+    text_input = st.chat_input(
+        "Type in English or Hindi… or use the mic 🎙️"
+    )
+
+# ── DETERMINE PROMPT SOURCE ──
+prompt = None
+
+# Voice — EARS
+if audio_bytes and audio_bytes != st.session_state.get("last_audio"):
+    st.session_state["last_audio"] = audio_bytes
+    with st.spinner("🎙️ Transcribing your voice..."):
+        transcribed = transcribe_audio(audio_bytes)
+    if transcribed:
+        st.info(f"🎙️ You said: *{transcribed}*")
+        prompt = transcribed
+
+# Text
+if text_input:
+    prompt = text_input
+
+# Quick question
 if "quick_q" in st.session_state and st.session_state["quick_q"]:
     prompt = st.session_state["quick_q"]
     st.session_state["quick_q"] = None
-else:
-    prompt = st.chat_input("Ask about any Action TESA product, application, or spec…")
 
 # ── RAG WORKFLOW ──
 if prompt and db_loaded:
@@ -366,12 +434,20 @@ if prompt and db_loaded:
             st.session_state.total_tokens += tokens_used
 
             print(f"\n[TESA RAG LOG]")
-            print(f"  Query   : {prompt}")
-            print(f"  Normalized: {normalize_query(prompt)}")
-            print(f"  Sources : {[c['source'] for c in chunks]}")
-            print(f"  Latency : {latency}s | Tokens: {tokens_used}")
+            print(f"  Query      : {prompt}")
+            print(f"  Normalized : {normalize_query(prompt)}")
+            print(f"  Sources    : {[c['source'] for c in chunks]}")
+            print(f"  Latency    : {latency}s | Tokens: {tokens_used}")
 
         st.markdown(reply)
+
+        # EBM: MOUTH — generate and store audio
+        with st.spinner("🔊 Generating audio..."):
+            audio_response = text_to_speech(reply)
+
+        if audio_response:
+            st.audio(audio_response, format="audio/mp3")
+
         unique_sources = list(set([c["source"] for c in chunks]))
         st.markdown(" ".join([
             f'<span class="source-tag">📄 {s}</span>'
@@ -381,6 +457,7 @@ if prompt and db_loaded:
     st.session_state.messages.append({
         "role": "assistant",
         "content": reply,
-        "sources": unique_sources
+        "sources": unique_sources,
+        "audio": audio_response if audio_response else None
     })
     st.rerun()
