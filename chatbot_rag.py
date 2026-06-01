@@ -6,7 +6,7 @@
 
 import os
 import time
-import chromadb
+from pinecone import Pinecone
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -15,10 +15,11 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @st.cache_resource
+@st.cache_resource
 def load_vector_db():
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    collection = chroma_client.get_collection("tesa_knowledge")
-    return collection
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    index = pc.Index(os.getenv("PINECONE_INDEX", "tesa-knowledge"))
+    return index
 
 # ── SPELLING CORRECTION ──
 def normalize_query(query):
@@ -48,21 +49,21 @@ def embed_query(query):
     return response.data[0].embedding
 
 # ── RETRIEVE — k=6, uses normalized query ──
-def retrieve_chunks(query, collection, k=6):
+def retrieve_chunks(query, index, k=6):
     normalized = normalize_query(query)
     query_embedding = embed_query(normalized)
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=k,
-        include=["documents", "metadatas", "distances"]
+    results = index.query(
+        vector=query_embedding,
+        top_k=k,
+        include_metadata=True
     )
     chunks = []
-    for i in range(len(results["documents"][0])):
+    for match in results["matches"]:
         chunks.append({
-            "text": results["documents"][0][i],
-            "source": results["metadatas"][0][i]["source"],
-            "url": results["metadatas"][0][i]["url"],
-            "distance": results["distances"][0][i]
+            "text": match["metadata"]["text"],
+            "source": match["metadata"]["source"],
+            "url": match["metadata"]["url"],
+            "distance": match["score"]
         })
     return chunks
 
@@ -297,11 +298,11 @@ with st.sidebar:
 
 # ── LOAD VECTOR DB ──
 try:
-    collection = load_vector_db()
+    index = load_vector_db()
     db_loaded = True
 except Exception as e:
     db_loaded = False
-    st.error("⚠️ Knowledge base not found. Run `python3 ingest.py` first.")
+    st.error(f"⚠️ Could not connect to Pinecone: {e}")
 
 # ── SESSION STATE ──
 if "messages" not in st.session_state:
@@ -345,7 +346,7 @@ if prompt and db_loaded:
     with st.chat_message("assistant"):
         with st.spinner("Searching knowledge base…"):
             start_time = time.time()
-            chunks = retrieve_chunks(prompt, collection, k=6)
+            chunks = retrieve_chunks(prompt, index, k=6)
             rag_prompt = build_rag_prompt(prompt, chunks)
 
             response = client.chat.completions.create(
